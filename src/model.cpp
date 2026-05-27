@@ -8,6 +8,9 @@
 #include <random>
 #include <numeric>
 #include <filesystem>
+#include <set>
+#include <array>
+#include <unordered_map>
 
 // ============================================================
 // Minimal JSON parser for safetensors header
@@ -206,8 +209,8 @@ static std::optional<std::vector<TensorMeta>> parse_safetensors_header(const std
         meta.dtype = str_fields[name + ".dtype"];
         meta.shape = arr_fields[name + ".shape"];
         auto dof = arr_fields[name + ".data_offsets"];
-        meta.data_offsets[0] = (dof.size() > 0) ? dof[0] : 0;
-        meta.data_offsets[1] = (dof.size() > 1) ? dof[1] : 0;
+        meta.data_offsets[0] = ((dof.size() > 0) ? dof[0] : 0) + (int64_t)(8 + header_len);
+        meta.data_offsets[1] = ((dof.size() > 1) ? dof[1] : 0) + (int64_t)(8 + header_len);
         tensors.push_back(meta);
     }
 
@@ -300,7 +303,7 @@ static std::map<std::string, Tensor> load_all_tensors(const std::string& model_p
     std::sort(st_files.begin(), st_files.end());
 
     for (auto& path : st_files) {
-        std::cout << "  Loading " << path.substr(path.find_last_of("/") + 1) << "..." << std::endl;
+        std::cerr << "  Loading " << path.substr(path.find_last_of("/") + 1) << "..." << std::endl;
         auto metas = parse_safetensors_header(path);
         if (!metas) { std::cerr << "  Failed to parse header" << std::endl; continue; }
 
@@ -318,13 +321,63 @@ static std::map<std::string, Tensor> load_all_tensors(const std::string& model_p
 }
 
 // ============================================================
+// Minimal config.json reader
+// ============================================================
+
+static int64_t parse_json_int(const std::string& s, const std::string& key) {
+    auto pos = s.find(key);
+    if (pos == std::string::npos) return 0;
+    pos += key.size();
+    while (pos < s.size() && (s[pos] == '"' || s[pos] == ':' || s[pos] == ' ' || s[pos] == '\n' || s[pos] == '\r' || s[pos] == '\t')) pos++;
+    bool neg = false;
+    if (pos < s.size() && s[pos] == '-') { neg = true; pos++; }
+    int64_t val = 0;
+    while (pos < s.size() && s[pos] >= '0' && s[pos] <= '9') val = val * 10 + (s[pos++] - '0');
+    return neg ? -val : val;
+}
+
+static double parse_json_float(const std::string& s, const std::string& key) {
+    auto pos = s.find(key);
+    if (pos == std::string::npos) return 0.0;
+    pos += key.size();
+    while (pos < s.size() && (s[pos] == '"' || s[pos] == ':' || s[pos] == ' ' || s[pos] == '\n' || s[pos] == '\r' || s[pos] == '\t')) pos++;
+    std::string num;
+    if (pos < s.size() && s[pos] == '-') { num += '-'; pos++; }
+    while (pos < s.size() && (s[pos] >= '0' && s[pos] <= '9')) num += s[pos++];
+    if (pos < s.size() && s[pos] == '.') {
+        num += '.'; pos++;
+        while (pos < s.size() && s[pos] >= '0' && s[pos] <= '9') num += s[pos++];
+    }
+    return std::stod(num);
+}
+
+// ============================================================
 // Model loading from safetensors
 // ============================================================
 
 Qwen36Model load_model_safetensors(const std::string& model_path) {
-    std::cout << "Loading model from: " << model_path << std::endl;
+    std::cerr << "Loading model from: " << model_path << std::endl;
     auto tensors = load_all_tensors(model_path);
     Qwen36Model model;
+
+    // --- Read config.json for architecture params ---
+    std::filesystem::path config_path = std::filesystem::path(model_path) / "config.json";
+    if (std::filesystem::exists(config_path)) {
+        std::ifstream cfg_file(config_path);
+        std::string cfg((std::istreambuf_iterator<char>(cfg_file)),
+                         std::istreambuf_iterator<char>());
+        model.num_layers = (int32_t)parse_json_int(cfg, "num_hidden_layers");
+        model.num_heads = (int32_t)parse_json_int(cfg, "num_attention_heads");
+        model.num_kv_heads = (int32_t)parse_json_int(cfg, "num_key_value_heads");
+        model.hidden_size = (int32_t)parse_json_int(cfg, "hidden_size");
+        model.vocab_size = (int32_t)parse_json_int(cfg, "vocab_size");
+        model.norm_eps = (float)parse_json_float(cfg, "rms_norm_eps");
+        model.rope_theta = (float)parse_json_float(cfg, "rope_theta");
+        // Try Qwen3-style head_dim fields first, then compute from shapes
+        int32_t head_dim_cfg = (int32_t)parse_json_int(cfg, "head_dim");
+        if (head_dim_cfg > 0) model.head_dim = head_dim_cfg;
+        // head_dim may be refined later from tensor shapes; log after that
+    }
 
     auto find_tensor = [&](const std::vector<std::string>& names) -> Tensor* {
         for (auto& name : names) {
@@ -339,31 +392,39 @@ Qwen36Model load_model_safetensors(const std::string& model_path) {
     // --- Embeddings ---
     auto* embed = find_tensor({"embed_tokens.weight", "model.embed_tokens.weight"});
     if (embed) {
-        model.vocab_size = (int32_t)embed->shape[0];
-        model.hidden_size = (int32_t)embed->shape[1];
+        if (!model.vocab_size) { model.vocab_size = (int32_t)embed->shape[0]; }
+        if (!model.hidden_size) { model.hidden_size = (int32_t)embed->shape[1]; }
         model.embeddings = *embed;
-        std::cout << "  Embeddings: " << model.vocab_size << " x " << model.hidden_size << std::endl;
+        std::cerr << "  Embeddings: " << model.vocab_size << " x " << model.hidden_size << std::endl;
     }
 
-    // --- Detect heads from q_proj ---
-    auto* q_proj = find_tensor({".q_proj"});
-    if (q_proj) {
-        model.hidden_size = (int32_t)q_proj->shape[1];
-        // Try to get the actual q_proj for layer 0
-        auto* q0 = find_tensor({"model.layers.0.self_attn.q_proj.weight"});
-        if (q0) {
-            model.num_heads = (int32_t)(q0->shape[0] / (q0->shape[0] / q0->shape[1]));
-            model.head_dim = model.hidden_size / model.num_heads;
-        } else {
-            model.num_heads = NUM_HEADS;
-            model.head_dim = (int32_t)(q_proj->shape[0] / NUM_HEADS);
+    // --- Infer head_dim from tensor shapes if not in config ---
+    int32_t head_dim_cfg = 0;
+    if (model.head_dim != HEAD_DIM) head_dim_cfg = model.head_dim;
+    if (!head_dim_cfg && model.num_heads > 0) {
+        model.head_dim = model.hidden_size / model.num_heads;
+    }
+    // If still no head_dim, try to get from k_proj shape / num_kv_heads
+    if (!model.head_dim) {
+        auto* k0 = find_tensor({"model.layers.0.self_attn.k_proj.weight"});
+        if (k0 && model.num_kv_heads > 0) {
+            model.head_dim = (int32_t)k0->shape[0] / model.num_kv_heads;
         }
     }
-
-    auto* k0 = find_tensor({"model.layers.0.self_attn.k_proj.weight"});
-    if (k0) {
-        model.num_kv_heads = (int32_t)(k0->shape[0] / model.head_dim);
+    if (!model.num_heads && model.head_dim > 0) {
+        auto* q0 = find_tensor({"model.layers.0.self_attn.q_proj.weight"});
+        if (q0) model.num_heads = (int32_t)q0->shape[0] / model.head_dim;
     }
+    if (!model.num_kv_heads && model.head_dim > 0) {
+        auto* k0 = find_tensor({"model.layers.0.self_attn.k_proj.weight"});
+        if (k0) model.num_kv_heads = (int32_t)k0->shape[0] / model.head_dim;
+    }
+
+    std::cerr << "  config: layers=" << model.num_layers
+              << ", heads=" << model.num_heads
+              << ", kv_heads=" << model.num_kv_heads
+              << ", hidden=" << model.hidden_size
+              << ", head_dim=" << model.head_dim << std::endl;
 
     // --- Detect layer count ---
     int32_t max_layer = -1;
@@ -378,7 +439,7 @@ Qwen36Model load_model_safetensors(const std::string& model_path) {
         }
     }
     model.num_layers = max_layer + 1;
-    std::cout << "  Layers: " << model.num_layers << std::endl;
+    std::cerr << "  Layers: " << model.num_layers << std::endl;
 
     model.layers.resize(model.num_layers);
 
@@ -395,20 +456,32 @@ Qwen36Model load_model_safetensors(const std::string& model_path) {
         // Input norm
         auto* inp_norm = gt("input_layernorm.weight");
         if (inp_norm) { model.layers[l].input_norm.weight = *inp_norm; }
+        model.layers[l].input_norm.eps = model.norm_eps;
 
         // Attention
         auto* qp = gt("self_attn.q_proj.weight");
         if (qp) model.layers[l].attn.q_proj = *qp;
+        auto* qb = gt("self_attn.q_proj.bias");
+        if (qb) model.layers[l].attn.q_proj_bias = *qb;
         auto* kp = gt("self_attn.k_proj.weight");
         if (kp) model.layers[l].attn.k_proj = *kp;
+        auto* kb = gt("self_attn.k_proj.bias");
+        if (kb) model.layers[l].attn.k_proj_bias = *kb;
         auto* vp = gt("self_attn.v_proj.weight");
         if (vp) model.layers[l].attn.v_proj = *vp;
+        auto* vb = gt("self_attn.v_proj.bias");
+        if (vb) model.layers[l].attn.v_proj_bias = *vb;
         auto* op = gt("self_attn.o_proj.weight");
         if (op) model.layers[l].attn.o_proj = *op;
+        auto* qn = gt("self_attn.q_norm.weight");
+        if (qn) model.layers[l].attn.q_norm = *qn;
+        auto* kn = gt("self_attn.k_norm.weight");
+        if (kn) model.layers[l].attn.k_norm = *kn;
 
         // Post-attention norm
         auto* atn_norm = gt("post_attention_layernorm.weight");
         if (atn_norm) { model.layers[l].attn_norm.weight = *atn_norm; }
+        model.layers[l].attn_norm.eps = model.norm_eps;
 
         // MLP (dense)
         auto* gate_w = gt("mlp.gate_proj.weight");
@@ -492,7 +565,7 @@ Qwen36Model load_model_safetensors(const std::string& model_path) {
     std::string merges_path = model_path + "/merges.txt";
     if (std::filesystem::exists(vocab_path)) {
         load_vocab(vocab_path, model.tokenizer.vocab, model.tokenizer.inv_vocab);
-        std::cout << "  Vocab: " << model.tokenizer.vocab.size() << " tokens" << std::endl;
+        std::cerr << "  Vocab: " << model.tokenizer.vocab.size() << " tokens" << std::endl;
     }
     if (std::filesystem::exists(merges_path)) {
         std::ifstream mf(merges_path);
@@ -504,14 +577,22 @@ Qwen36Model load_model_safetensors(const std::string& model_path) {
                 model.tokenizer.merges.emplace_back(line.substr(0, sp), line.substr(sp + 1));
             }
         }
-        std::cout << "  Merges: " << model.tokenizer.merges.size() << std::endl;
+        std::cerr << "  Merges: " << model.tokenizer.merges.size() << std::endl;
     }
+
+    // Load added (special) tokens
+    load_added_tokens(model_path, model.tokenizer.vocab, model.tokenizer.inv_vocab);
+    // Update special token IDs from added tokens
+    if (model.tokenizer.vocab.count("<|endoftext|>"))
+        model.tokenizer.bos_token_id = model.tokenizer.vocab["<|endoftext|>"];
+    if (model.tokenizer.vocab.count("<|im_end|>"))
+        model.tokenizer.eos_token_id = model.tokenizer.vocab["<|im_end|>"];
 
     // Report
     size_t total_bytes = 0;
     for (auto& [k, v] : tensors) total_bytes += v.byte_size;
-    std::cout << "  Total memory: " << (total_bytes / 1024 / 1024) << " MB" << std::endl;
-    std::cout << "  Architecture: " << (model.is_moe ? "MoE" : "Dense")
+    std::cerr << "  Total memory: " << (total_bytes / 1024 / 1024) << " MB" << std::endl;
+    std::cerr << "  Architecture: " << (model.is_moe ? "MoE" : "Dense")
               << ", " << model.num_layers << "L, h=" << model.hidden_size
               << ", heads=" << model.num_heads << ", head_dim=" << model.head_dim
               << std::endl;
@@ -555,6 +636,108 @@ void load_vocab(const std::string& path,
 }
 
 // ============================================================
+// Load added (special) tokens from tokenizer_config.json
+// ============================================================
+
+void load_added_tokens(const std::string& model_path,
+                       std::map<std::string, int32_t>& vocab,
+                       std::map<int32_t, std::string>& inv_vocab) {
+    // Try tokenizer_config.json first
+    std::filesystem::path cfg_path = std::filesystem::path(model_path) / "tokenizer_config.json";
+    if (!std::filesystem::exists(cfg_path)) return;
+
+    std::ifstream f(cfg_path);
+    if (!f) return;
+    std::string content((std::istreambuf_iterator<char>(f)),
+                         std::istreambuf_iterator<char>());
+
+    // Parse "added_tokens_decoder": { "ID": {"content": "TOKEN", ...}, ... }
+    auto ad_pos = content.find("\"added_tokens_decoder\"");
+    if (ad_pos == std::string::npos) return;
+
+    size_t pos = content.find('{', ad_pos);
+    if (pos == std::string::npos) return;
+
+    // Now parse each entry: "ID": {"content": "TOKEN", ...}
+    while (pos < content.size() && content[pos] != '}') {
+        // Parse key (token ID as string)
+        while (pos < content.size() && content[pos] != '"' && content[pos] != '}') pos++;
+        if (pos >= content.size() || content[pos] == '}') break;
+
+        std::string id_str;
+        if (!parse_json_string(content, pos, id_str)) break;
+        int32_t id = std::stoi(id_str);
+
+        // Skip to "content" field
+        auto content_pos = content.find("\"content\"", pos);
+        if (content_pos == std::string::npos || content_pos > content.find('}', pos)) {
+            // No content field, skip this entry
+            while (pos < content.size() && content[pos] != '}') pos++;
+            if (pos < content.size()) pos++; // skip }
+            if (pos < content.size() && content[pos] == ',') pos++;
+            continue;
+        }
+        pos = content_pos + 9; // skip "content"
+
+        // Parse string value
+        while (pos < content.size() && content[pos] != '"') pos++;
+        std::string token_text;
+        if (!parse_json_string(content, pos, token_text)) break;
+
+        // Register the token
+        vocab[token_text] = id;
+        inv_vocab[id] = token_text;
+
+        // Skip to end of this entry
+        while (pos < content.size() && content[pos] != '}') pos++;
+        if (pos < content.size()) pos++; // skip }
+        if (pos < content.size() && content[pos] == ',') pos++;
+    }
+
+    std::cerr << "  Added tokens registered" << std::endl;
+}
+
+// ============================================================
+// GPT-2 bytes-to-unicode mapping
+// ============================================================
+
+static std::array<std::string, 256> build_byte_to_unicode() {
+    // Compute the set of "printable" byte values that map to themselves
+    std::set<int> printable;
+    for (int b = '!'; b <= '~'; b++) printable.insert(b);
+    for (int b = 0xC2; b <= 0xC2; b++) {} // placeholder
+    // Actually: ¡(0xA1) through ¬(0xAC) and ®(0xAE) through ÿ(0xFF) map to themselves
+    for (int b = 0xA1; b <= 0xAC; b++) printable.insert(b);
+    for (int b = 0xAE; b <= 0xFF; b++) printable.insert(b);
+
+    std::array<std::string, 256> byte_to_unicode;
+    int n = 0;
+    for (int b = 0; b < 256; b++) {
+        int codepoint;
+        if (printable.count(b)) {
+            codepoint = b;
+        } else {
+            codepoint = 256 + n;
+            n++;
+        }
+        // Encode codepoint as UTF-8
+        if (codepoint < 0x80) {
+            byte_to_unicode[b] = std::string(1, (char)codepoint);
+        } else if (codepoint < 0x800) {
+            byte_to_unicode[b] = std::string(1, (char)(0xC0 | (codepoint >> 6))) +
+                                 std::string(1, (char)(0x80 | (codepoint & 0x3F)));
+        } else {
+            byte_to_unicode[b] = std::string(1, (char)(0xE0 | (codepoint >> 12))) +
+                                 std::string(1, (char)(0x80 | ((codepoint >> 6) & 0x3F))) +
+                                 std::string(1, (char)(0x80 | (codepoint & 0x3F)));
+        }
+    }
+    return byte_to_unicode;
+}
+
+static const std::array<std::string, 256> BYTE_TO_UNICODE = build_byte_to_unicode();
+
+// ============================================================
 // Tokenizer
 // ============================================================
 
@@ -571,6 +754,12 @@ std::vector<int32_t> tokenize(const TokenizerConfig& tok, const std::string& tex
             tokens.push_back(id);
         }
         return tokens;
+    }
+
+    // Step 1: Convert raw bytes to GPT-2 unicode representation
+    std::string unicode_text;
+    for (unsigned char c : text) {
+        unicode_text += BYTE_TO_UNICODE[c];
     }
 
     // BPE tokenization
@@ -609,17 +798,33 @@ std::vector<int32_t> tokenize(const TokenizerConfig& tok, const std::string& tex
         return tokens;
     };
 
-    // Split text into words (whitespace-separated)
+    // Split unicode text into words (whitespace-separated, but \n is now 'Ċ' not whitespace)
     std::vector<std::string> words;
     {
         std::string current;
-        for (char c : text) {
-            if (std::isspace((unsigned char)c)) {
+        for (size_t i = 0; i < unicode_text.size(); ) {
+            // Extract one UTF-8 codepoint
+            size_t j = i;
+            uint8_t c = (uint8_t)unicode_text[i];
+            if (c < 0x80) j = i + 1;
+            else if (c < 0xE0) j = i + 2;
+            else if (c < 0xF0) j = i + 3;
+            else j = i + 4;
+            if (j > unicode_text.size()) j = unicode_text.size();
+            std::string ch = unicode_text.substr(i, j - i);
+            i = j;
+
+            // GPT-2: space (byte 32 → 'Ġ') marks word boundaries
+            if (ch == BYTE_TO_UNICODE[32]) { // 'Ġ' = space
                 if (!current.empty()) words.push_back(current);
-                words.push_back(std::string(1, c));
+                current.clear();
+                current += ch;  // 'Ġ' is the start of the next word
+            } else if (ch == BYTE_TO_UNICODE[10]) { // 'Ċ' = newline
+                if (!current.empty()) words.push_back(current);
+                words.push_back(ch);  // newline as its own word
                 current.clear();
             } else {
-                current += c;
+                current += ch;
             }
         }
         if (!current.empty()) words.push_back(current);
@@ -638,13 +843,50 @@ std::vector<int32_t> tokenize(const TokenizerConfig& tok, const std::string& tex
 }
 
 std::vector<std::string> decode_tokens(const TokenizerConfig& tok, const std::vector<int32_t>& ids) {
+    // Build reverse mapping: unicode character -> original byte
+    static std::unordered_map<std::string, uint8_t> unicode_to_byte;
+    static bool built = false;
+    if (!built) {
+        for (int b = 0; b < 256; b++) {
+            unicode_to_byte[BYTE_TO_UNICODE[b]] = (uint8_t)b;
+        }
+        built = true;
+    }
+
     std::vector<std::string> result;
     for (auto id : ids) {
         auto it = tok.inv_vocab.find(id);
-        if (it != tok.inv_vocab.end()) result.push_back(it->second);
-        else result.push_back("<" + std::to_string(id) + ">");
+        if (it == tok.inv_vocab.end()) {
+            result.push_back("<" + std::to_string(id) + ">");
+            continue;
+        }
+        const std::string& token = it->second;
+        std::string decoded;
+        for (size_t i = 0; i < token.size(); ) {
+            size_t j = i;
+            uint8_t c = (uint8_t)token[i];
+            if (c < 0x80) j = i + 1;
+            else if (c < 0xE0) j = i + 2;
+            else if (c < 0xF0) j = i + 3;
+            else j = i + 4;
+            if (j > token.size()) j = token.size();
+            std::string uni = token.substr(i, j - i);
+            auto bit = unicode_to_byte.find(uni);
+            if (bit != unicode_to_byte.end()) {
+                decoded += (char)bit->second;
+            } else {
+                decoded += uni;
+            }
+            i = j;
+        }
+        result.push_back(decoded);
     }
     return result;
+}
+
+std::string decode_token(const TokenizerConfig& tok, int32_t id) {
+    auto decoded = decode_tokens(tok, {id});
+    return decoded.empty() ? "" : decoded[0];
 }
 
 // ============================================================
@@ -677,6 +919,10 @@ static void add_vectors(float* out, const float* a, const float* b, int32_t n) {
     for (int32_t i = 0; i < n; i++) out[i] = a[i] + b[i];
 }
 
+static void add_bias(float* out, const float* bias, int32_t n) {
+    for (int32_t i = 0; i < n; i++) out[i] += bias[i];
+}
+
 static float swiglu(float x) {
     return x * (1.0f / (1.0f + std::exp(-x)));
 }
@@ -685,25 +931,28 @@ static float swiglu(float x) {
 // RoPE (Rotary Position Embedding)
 // ============================================================
 
-static void apply_rope(float* q, float* k, int32_t dim, int32_t head_dim,
-                       int32_t pos, const float* inv_freq, int32_t inv_freq_size) {
+// Apply RoPE to a single tensor (used for Q or K separately)
+static void rope_single(float* x, int32_t dim, int32_t head_dim, int32_t pos,
+                        const float* inv_freq, int32_t inv_freq_size) {
     int32_t num_heads = dim / head_dim;
     for (int32_t h = 0; h < num_heads; h++) {
-        float* q_head = q + h * head_dim;
-        float* k_head = k + h * head_dim;
+        float* x_head = x + h * head_dim;
         for (int32_t i = 0; i < head_dim / 2; i++) {
             int32_t fi = std::min(i, inv_freq_size - 1);
             float freq = inv_freq[fi] * pos;
             float cos_v = std::cos(freq);
             float sin_v = std::sin(freq);
-            float q0 = q_head[2 * i], q1 = q_head[2 * i + 1];
-            float k0 = k_head[2 * i], k1 = k_head[2 * i + 1];
-            q_head[2 * i]     = q0 * cos_v - q1 * sin_v;
-            q_head[2 * i + 1] = q0 * sin_v + q1 * cos_v;
-            k_head[2 * i]     = k0 * cos_v - k1 * sin_v;
-            k_head[2 * i + 1] = k0 * sin_v + k1 * cos_v;
+            float x0 = x_head[2 * i], x1 = x_head[2 * i + 1];
+            x_head[2 * i]     = x0 * cos_v - x1 * sin_v;
+            x_head[2 * i + 1] = x0 * sin_v + x1 * cos_v;
         }
     }
+}
+
+static void apply_rope(float* q, float* k, int32_t q_dim, int32_t k_dim, int32_t head_dim,
+                       int32_t pos, const float* inv_freq, int32_t inv_freq_size) {
+    rope_single(q, q_dim, head_dim, pos, inv_freq, inv_freq_size);
+    rope_single(k, k_dim, head_dim, pos, inv_freq, inv_freq_size);
 }
 
 // ============================================================
@@ -728,7 +977,7 @@ static void compute_attention(
         const float* q_h = q + h * head_dim;
         for (int32_t s = 0; s < seq_len; s++) {
             float sum = 0.0f;
-            const float* k_h = k_cache + (kv_h * seq_len + s) * head_dim;
+            const float* k_h = k_cache + (s * num_kv_heads + kv_h) * head_dim;
             for (int32_t d = 0; d < head_dim; d++) sum += q_h[d] * k_h[d];
             logits[h * seq_len + s] = sum * scale;
         }
@@ -755,7 +1004,7 @@ static void compute_attention(
         std::fill(o_h, o_h + head_dim, 0.0f);
         for (int32_t s = 0; s < seq_len; s++) {
             float w = weights[h * seq_len + s];
-            const float* v_h = v_cache + (kv_h * seq_len + s) * head_dim;
+            const float* v_h = v_cache + (s * num_kv_heads + kv_h) * head_dim;
             for (int32_t d = 0; d < head_dim; d++) o_h[d] += w * v_h[d];
         }
     }
@@ -842,7 +1091,8 @@ static void moe_forward(
 }
 
 // ============================================================
-// Forward pass (CPU)
+// Forward pass (CPU) - processes all positions in input_ids
+// Returns logits for the last position
 // ============================================================
 
 std::vector<float> forward_cpu(
@@ -856,133 +1106,141 @@ std::vector<float> forward_cpu(
     int32_t num_layers = model.num_layers;
     int32_t kv_dim = model.num_kv_heads * model.head_dim;
     int32_t total_heads_dim = model.num_heads * model.head_dim;
+    int32_t ffn_dim = model.ffn_intermediate;
 
-    // KV cache: [layer][seq][kv_dim]
+    // KV cache: [layer][seq][dim]
     float* k_cache = new float[num_layers * seq_len * kv_dim]();
     float* v_cache = new float[num_layers * seq_len * kv_dim]();
 
-    // Hidden states
-    float* hidden_states = new float[hidden]();
+    // Hidden states: [seq_len, hidden]
+    float* hidden_states = new float[seq_len * hidden]();
 
-    // Add embeddings of all input tokens
-    for (int32_t id : input_ids) {
+    // Load embeddings for each position
+    for (int32_t pos = 0; pos < seq_len; pos++) {
+        int32_t id = input_ids[pos];
         if (id >= 0 && id < model.vocab_size) {
             const float* emb = model.embeddings.data + id * hidden;
-            for (int32_t d = 0; d < hidden; d++) hidden_states[d] += emb[d];
+            std::copy(emb, emb + hidden, hidden_states + pos * hidden);
         }
     }
 
-    // Temporary buffers
-    float* residual = new float[hidden]();
-    float* norm_out = new float[hidden]();
-    float* attn_out = new float[hidden]();
-    float* q = new float[total_heads_dim]();
-    float* k = new float[kv_dim]();
-    float* v = new float[kv_dim]();
+    // Temporary buffers (per-position processing)
+    float* q_buf = new float[total_heads_dim]();
+    float* k_buf = new float[kv_dim]();
+    float* v_buf = new float[kv_dim]();
     float* attn_result = new float[total_heads_dim]();
-    float* mlp_out = new float[hidden]();
-    float* gate_act = new float[model.ffn_intermediate]();
-    float* up_act = new float[model.ffn_intermediate]();
+    float* attn_out = new float[hidden]();
+    float* mlp_out = new float[ffn_dim]();
+    float* gate_act = new float[ffn_dim]();
+    float* up_act = new float[ffn_dim]();
 
-    // Process each layer
+    // Process each layer — per-position end-to-end
     for (int32_t l = 0; l < num_layers; l++) {
         const auto& layer = model.layers[l];
 
-        // Input normalization
-        rms_norm(norm_out, hidden_states, layer.input_norm.weight.data,
-                 hidden, layer.input_norm.eps);
+        for (int32_t pos = 0; pos < seq_len; pos++) {
+            // --- Input norm ---
+            rms_norm(attn_out, hidden_states + pos * hidden,
+                     layer.input_norm.weight.data, hidden, layer.input_norm.eps);
 
-        // Save residual
-        std::copy(hidden_states, hidden_states + hidden, residual);
+            // --- K projection + RoPE + cache ---
+            matmul_transpose(layer.attn.k_proj.data, kv_dim, hidden,
+                             attn_out, 1, k_buf);
+            if (layer.attn.k_proj_bias.data)
+                add_bias(k_buf, layer.attn.k_proj_bias.data, kv_dim);
 
-        // --- Attention ---
-        // Q projection: norm @ q_proj^T
-        matmul_transpose(layer.attn.q_proj.data, hidden, hidden,
-                         norm_out, 1, q);
+            rope_single(k_buf, kv_dim, model.head_dim,
+                        pos, model.rope_inv_freq, model.rope_inv_freq_size);
 
-        // K projection
-        matmul_transpose(layer.attn.k_proj.data, kv_dim, hidden,
-                         norm_out, 1, k);
+            std::copy(k_buf, k_buf + kv_dim,
+                      k_cache + l * seq_len * kv_dim + pos * kv_dim);
 
-        // V projection
-        matmul_transpose(layer.attn.v_proj.data, kv_dim, hidden,
-                         norm_out, 1, v);
+            // --- V projection + cache ---
+            matmul_transpose(layer.attn.v_proj.data, kv_dim, hidden,
+                             attn_out, 1, v_buf);
+            if (layer.attn.v_proj_bias.data)
+                add_bias(v_buf, layer.attn.v_proj_bias.data, kv_dim);
 
-        // RoPE (apply to last position)
-        apply_rope(q, k, total_heads_dim, model.head_dim,
-                   seq_len - 1, model.rope_inv_freq, model.rope_inv_freq_size);
+            std::copy(v_buf, v_buf + kv_dim,
+                      v_cache + l * seq_len * kv_dim + pos * kv_dim);
 
-        // Store in KV cache
-        std::copy(k, k + kv_dim,
-                  k_cache + l * seq_len * kv_dim + (seq_len - 1) * kv_dim);
-        std::copy(v, v + kv_dim,
-                  v_cache + l * seq_len * kv_dim + (seq_len - 1) * kv_dim);
+            // --- Q projection + RoPE ---
+            matmul_transpose(layer.attn.q_proj.data, hidden, hidden,
+                             attn_out, 1, q_buf);
+            if (layer.attn.q_proj_bias.data)
+                add_bias(q_buf, layer.attn.q_proj_bias.data, hidden);
 
-        // Attention
-        compute_attention(attn_result, q,
-                          k_cache + l * seq_len * kv_dim,
-                          v_cache + l * seq_len * kv_dim,
-                          seq_len, model.num_heads, model.head_dim, model.num_kv_heads);
+            rope_single(q_buf, total_heads_dim, model.head_dim,
+                        pos, model.rope_inv_freq, model.rope_inv_freq_size);
 
-        // Output projection
-        matmul_transpose(layer.attn.o_proj.data, hidden, total_heads_dim,
-                         attn_result, 1, attn_out);
+            // --- Attention (causal: attend to positions 0..pos) ---
+            compute_attention(
+                attn_result,
+                q_buf,
+                k_cache + l * seq_len * kv_dim,
+                v_cache + l * seq_len * kv_dim,
+                pos + 1, model.num_heads, model.head_dim, model.num_kv_heads);
 
-        // Residual
-        add_vectors(hidden_states, residual, attn_out, hidden);
+            // Output projection + residual
+            matmul_transpose(layer.attn.o_proj.data, hidden, total_heads_dim,
+                             attn_result, 1, attn_out);
+            add_vectors(hidden_states + pos * hidden,
+                        hidden_states + pos * hidden,
+                        attn_out, hidden);
 
-        // --- MLP / MoE ---
-        rms_norm(norm_out, hidden_states, layer.attn_norm.weight.data,
-                 hidden, layer.attn_norm.eps);
+            // --- Post-attention norm ---
+            rms_norm(attn_out, hidden_states + pos * hidden,
+                     layer.attn_norm.weight.data, hidden, layer.attn_norm.eps);
 
-        std::copy(hidden_states, hidden_states + hidden, residual);
+            // --- MLP ---
+            if (layer.moe.experts && layer.moe.gate.data) {
+                moe_forward(mlp_out, attn_out, hidden, layer.moe, model.top_k);
+            } else if (layer.mlp.gate_proj.data) {
+                matmul_transpose(layer.mlp.gate_proj.data, ffn_dim, hidden,
+                                 attn_out, 1, gate_act);
+                matmul_transpose(layer.mlp.up_proj.data, ffn_dim, hidden,
+                                 attn_out, 1, up_act);
+                for (int32_t i = 0; i < ffn_dim; i++)
+                    mlp_out[i] = swiglu(gate_act[i]) * up_act[i];
+                matmul_transpose(layer.mlp.down_proj.data, hidden, ffn_dim,
+                                 mlp_out, 1, mlp_out);
+            }
 
-        if (layer.moe.experts && layer.moe.gate.data) {
-            // MoE path
-            moe_forward(mlp_out, norm_out, hidden, layer.moe, model.top_k);
-        } else if (layer.mlp.gate_proj.data) {
-            // Dense MLP
-            matmul_transpose(layer.mlp.gate_proj.data, model.ffn_intermediate, hidden,
-                             norm_out, 1, gate_act);
-            matmul_transpose(layer.mlp.up_proj.data, model.ffn_intermediate, hidden,
-                             norm_out, 1, up_act);
-            for (int32_t i = 0; i < model.ffn_intermediate; i++)
-                mlp_out[i] = swiglu(gate_act[i]) * up_act[i];
-            matmul_transpose(layer.mlp.down_proj.data, hidden, model.ffn_intermediate,
-                             mlp_out, 1, mlp_out);
+            // Residual
+            add_vectors(hidden_states + pos * hidden,
+                        hidden_states + pos * hidden,
+                        mlp_out, hidden);
         }
-
-        // Residual
-        add_vectors(hidden_states, residual, mlp_out, hidden);
     }
 
-    // Final norm
-    rms_norm(norm_out, hidden_states, model.final_norm.data,
+    // Final norm on last position
+    float* final_norm_out = new float[hidden]();
+    rms_norm(final_norm_out, hidden_states + (seq_len - 1) * hidden, model.final_norm.data,
              hidden, model.norm_eps);
 
     // LM head
     int32_t vocab = model.vocab_size;
     std::vector<float> logits(vocab);
     matmul_transpose(model.lm_head.data, vocab, hidden,
-                     norm_out, 1, logits.data());
+                     final_norm_out, 1, logits.data());
 
     // Cleanup
     delete[] k_cache; delete[] v_cache;
-    delete[] hidden_states; delete[] residual;
-    delete[] norm_out; delete[] attn_out;
-    delete[] q; delete[] k; delete[] v;
-    delete[] attn_result; delete[] mlp_out;
-    delete[] gate_act; delete[] up_act;
+    delete[] hidden_states;
+    delete[] final_norm_out;
+    delete[] q_buf; delete[] k_buf; delete[] v_buf;
+    delete[] attn_result; delete[] attn_out;
+    delete[] mlp_out; delete[] gate_act; delete[] up_act;
 
     if (debug) {
         std::vector<std::pair<float, int32_t>> top(logits.size());
         for (int32_t i = 0; i < (int32_t)logits.size(); i++) top[i] = {logits[i], (int32_t)i};
         std::sort(top.begin(), top.end(),
                   [](auto& a, auto& b) { return a.first > b.first; });
-        std::cout << "Top-5: ";
+        std::cerr << "[DEBUG] Top-5: ";
         for (int32_t i = 0; i < 5 && i < (int32_t)top.size(); i++)
-            std::cout << "(" << top[i].second << ":" << top[i].first << ") ";
-        std::cout << std::endl;
+            std::cerr << "(" << top[i].second << ":" << top[i].first << ") ";
+        std::cerr << std::endl;
     }
 
     return logits;

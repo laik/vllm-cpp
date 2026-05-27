@@ -8,6 +8,75 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 # CPU compiler flags
 set(CPU_FLAGS "-O3;-march=native;-fpic;-Wno-unused-result")
 
+# Detect MLX (macOS Metal acceleration)
+find_path(MLX_INCLUDE_DIR mlx/mlx.h
+    HINTS /opt/homebrew/lib/python3.11/site-packages/mlx/include
+    DOC "MLX C++ headers"
+)
+find_library(MLX_LIBRARY mlx
+    HINTS /opt/homebrew/lib/python3.11/site-packages/mlx/lib
+    DOC "MLX shared library"
+)
+find_library(MLX_JACCL_LIBRARY jaccl
+    HINTS /opt/homebrew/lib/python3.11/site-packages/mlx/lib
+    DOC "MLX jaccl shared library"
+)
+
+if(MLX_INCLUDE_DIR AND MLX_LIBRARY)
+    set(MLX_FOUND TRUE)
+    message(STATUS "MLX found: ${MLX_LIBRARY}")
+    message(STATUS "MLX include: ${MLX_INCLUDE_DIR}")
+
+    add_library(mlx_backend SHARED src/mlx_backend.cpp)
+    target_include_directories(mlx_backend PUBLIC src ${MLX_INCLUDE_DIR})
+    target_link_libraries(mlx_backend PRIVATE vllm-core ${MLX_LIBRARY} ${MLX_JACCL_LIBRARY})
+    target_compile_options(mlx_backend PRIVATE ${CPU_FLAGS})
+    target_compile_definitions(mlx_backend PUBLIC HAS_MLX)
+    set_target_properties(mlx_backend PROPERTIES
+        BUILD_RPATH "${CMAKE_CURRENT_SOURCE_DIR}/build;/opt/homebrew/lib/python3.11/site-packages/mlx/lib"
+        INSTALL_RPATH "/opt/homebrew/lib/python3.11/site-packages/mlx/lib"
+    )
+
+    # MLX runner
+    add_executable(mlx_runner src/mlx_runner.cpp)
+    target_include_directories(mlx_runner PRIVATE src ${MLX_INCLUDE_DIR})
+    target_link_libraries(mlx_runner vllm-core mlx_backend ${MLX_LIBRARY} ${MLX_JACCL_LIBRARY})
+    target_compile_options(mlx_runner PRIVATE ${CPU_FLAGS})
+    set_target_properties(mlx_runner PROPERTIES
+        BUILD_RPATH "${CMAKE_CURRENT_BINARY_DIR};${CMAKE_CURRENT_SOURCE_DIR}/build;/opt/homebrew/lib/python3.11/site-packages/mlx/lib"
+        INSTALL_RPATH "/opt/homebrew/lib/python3.11/site-packages/mlx/lib"
+    )
+
+    # HTTP server with MLX GPU
+    add_executable(http_server src/http_server.cpp)
+    target_include_directories(http_server PRIVATE src ${MLX_INCLUDE_DIR})
+    target_link_libraries(http_server vllm-core mlx_backend ${MLX_LIBRARY} ${MLX_JACCL_LIBRARY})
+    target_compile_options(http_server PRIVATE ${CPU_FLAGS})
+    set_target_properties(http_server PROPERTIES
+        BUILD_RPATH "${CMAKE_CURRENT_BINARY_DIR};${CMAKE_CURRENT_SOURCE_DIR}/build;/opt/homebrew/lib/python3.11/site-packages/mlx/lib"
+        INSTALL_RPATH "/opt/homebrew/lib/python3.11/site-packages/mlx/lib"
+    )
+
+    # Interactive CLI with MLX GPU
+    add_executable(interactive src/interactive.cpp)
+    target_include_directories(interactive PRIVATE src ${MLX_INCLUDE_DIR})
+    target_link_libraries(interactive vllm-core mlx_backend ${MLX_LIBRARY} ${MLX_JACCL_LIBRARY})
+    target_compile_options(interactive PRIVATE ${CPU_FLAGS})
+    set_target_properties(interactive PROPERTIES
+        BUILD_RPATH "${CMAKE_CURRENT_BINARY_DIR};${CMAKE_CURRENT_SOURCE_DIR}/build;/opt/homebrew/lib/python3.11/site-packages/mlx/lib"
+        INSTALL_RPATH "/opt/homebrew/lib/python3.11/site-packages/mlx/lib"
+    )
+else()
+    message(STATUS "MLX not found — building CPU-only server/CLI")
+    add_executable(http_server src/http_server.cpp)
+    target_link_libraries(http_server vllm-core)
+    target_compile_options(http_server PRIVATE ${CPU_FLAGS})
+
+    add_executable(interactive src/interactive.cpp)
+    target_link_libraries(interactive vllm-core)
+    target_compile_options(interactive PRIVATE ${CPU_FLAGS})
+endif()
+
 # Detect CUDA
 find_package(CUDA 11.8 QUIET)
 
@@ -35,10 +104,7 @@ add_executable(cpu_runner src/cpu_runner.cpp)
 target_link_libraries(cpu_runner vllm-core)
 target_compile_options(cpu_runner PRIVATE ${CPU_FLAGS})
 
-# HTTP server
-add_executable(http_server src/http_server.cpp)
-target_link_libraries(http_server vllm-core)
-target_compile_options(http_server PRIVATE ${CPU_FLAGS})
+# (http_server and interactive built with MLX above)
 
 # CUDA library
 if(CUDA_FOUND)

@@ -150,7 +150,9 @@ int main(int argc, char* argv[]) {
         }
     }
     delete[] model.embeddings.data;
-    delete[] model.lm_head.data;
+    // Only delete lm_head if it doesn't share embeddings (tie_word_embeddings)
+    if (model.lm_head.data != model.embeddings.data)
+        delete[] model.lm_head.data;
     delete[] model.rope_inv_freq;
 
     return 0;

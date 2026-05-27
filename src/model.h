@@ -51,6 +51,9 @@ struct Qwen36AttnLayer {
     Tensor o_proj;    // [hidden_size, hidden_size]
     Tensor q_norm;    // [head_dim] - Qwen3 head dim norm
     Tensor k_norm;    // [head_dim] - Qwen3 head dim norm
+    Tensor q_proj_bias; // [hidden_size] - Qwen2 bias
+    Tensor k_proj_bias; // [num_kv_heads * head_dim]
+    Tensor v_proj_bias; // [num_kv_heads * head_dim]
 };
 
 struct Qwen36FFNLayer {
@@ -165,8 +168,13 @@ void load_vocab(const std::string& path,
                 std::map<std::string, int32_t>& vocab,
                 std::map<int32_t, std::string>& inv_vocab);
 
+void load_added_tokens(const std::string& model_path,
+                       std::map<std::string, int32_t>& vocab,
+                       std::map<int32_t, std::string>& inv_vocab);
+
 std::vector<int32_t> tokenize(const TokenizerConfig& tok, const std::string& text);
 std::vector<std::string> decode_tokens(const TokenizerConfig& tok, const std::vector<int32_t>& ids);
+std::string decode_token(const TokenizerConfig& tok, int32_t id);
 
 // ============================================================
 // PagedAttention structures

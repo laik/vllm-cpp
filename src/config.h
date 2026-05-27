@@ -58,8 +58,10 @@ constexpr float      TEMPERATURE         = 0.7f;
 constexpr float      TOP_P               = 0.8f;
 constexpr float      REPEAT_PENALTY      = 1.1f;
 constexpr int32_t    MAX_NEW_TOKENS      = 2048;
-constexpr int32_t    BOS_TOKEN_ID        = 151643;  // <|begin_of_text|>
-constexpr int32_t    EOS_TOKEN_ID        = 151645;  // <|end_of_text|>
+constexpr int32_t    BOS_TOKEN_ID        = 151643;  // <|endoftext|>
+constexpr int32_t    EOS_TOKEN_ID        = 151645;  // <|im_end|>
+constexpr int32_t    IM_START_TOKEN_ID   = 151644;  // <|im_start|>
+constexpr int32_t    IM_END_TOKEN_ID     = 151645;  // <|im_end|>
 
 // ----- Runtime -----
 constexpr int32_t    MAX_BATCH_SIZE      = 4;
@@ -73,7 +75,7 @@ struct TokenizerConfig {
     std::map<std::string, int32_t> vocab;  // string -> token id
     std::map<int32_t, std::string> inv_vocab; // token id -> string
     std::vector<std::pair<std::string, std::string>> merges; // BPE merges
-    int32_t unk_token_id = 151644;         // <|unk|>
+    int32_t unk_token_id = 0;               // fallback token (matches Python reference)
     int32_t bos_token_id = BOS_TOKEN_ID;
     int32_t eos_token_id = EOS_TOKEN_ID;
 };
