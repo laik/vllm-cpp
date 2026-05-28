@@ -1,6 +1,9 @@
 #include "mlx_backend.h"
 #include "config.h"
 #include "device.h"
+#ifdef HAS_NCCL
+#include "tp.h"
+#endif
 #include <iostream>
 #include <string>
 #include <cstring>
@@ -349,16 +352,50 @@ static void client_thread(int32_t fd, MlxModel* model, const std::string& model_
 }
 
 int main(int argc, char* argv[]) {
-    if (argc < 2) { std::cerr << "Usage: " << argv[0] << " <model_path> [--port PORT] [--debug]\n"; return 1; }
+    if (argc < 2) {
+        std::cerr << "Usage: " << argv[0] << " <model_path> [options]\n"
+                  << "Options:\n"
+                  << "  --port PORT                  HTTP port (default: 8080)\n"
+                  << "  --tensor-parallel-size N     Number of GPUs for tensor parallelism (default: 1)\n"
+                  << "  --tensor-parallel-rank R     TP rank / GPU ID (default: 0)\n"
+                  << "  --nccl-socket-ifname IFACE   Network interface for NCCL (default: auto)\n"
+                  << "  --gpu-memory-utilization F   GPU memory fraction (default: 0.9)\n"
+                  << "  --max-model-len N            Max sequence length (default: auto)\n"
+                  << "  --debug                      Enable debug output\n"
+                  << "\n";
+        return 1;
+    }
 
-    std::string model_path = argv[1]; int32_t port = 8080; bool debug = false;
+    std::string model_path = argv[1];
+    int32_t port = 8080;
+    int32_t tp_size = 1;
+    int32_t tp_rank = 0;
+    std::string nccl_ifname;
+    float gpu_mem_util = 0.9f;
+    int32_t max_model_len = 0;
+    bool debug = false;
+
     for (int i = 2; i < argc; i++) {
         std::string arg = argv[i];
         if (arg == "--port" && i + 1 < argc) port = std::stoi(argv[++i]);
+        else if (arg == "--tensor-parallel-size" && i + 1 < argc) tp_size = std::stoi(argv[++i]);
+        else if (arg == "--tensor-parallel-rank" && i + 1 < argc) tp_rank = std::stoi(argv[++i]);
+        else if (arg == "--nccl-socket-ifname" && i + 1 < argc) nccl_ifname = argv[++i];
+        else if (arg == "--gpu-memory-utilization" && i + 1 < argc) gpu_mem_util = std::stof(argv[++i]);
+        else if (arg == "--max-model-len" && i + 1 < argc) max_model_len = std::stoi(argv[++i]);
         else if (arg == "--debug") debug = true;
     }
 
     DeviceInfo::print_info();
+
+#ifdef HAS_NCCL
+    if (tp_size > 1) {
+        log_info("initializing tensor parallel: rank=" + std::to_string(tp_rank) +
+                 "/size=" + std::to_string(tp_size));
+        auto* tp = tp_get();
+        tp_init(tp_rank, tp_size, nccl_ifname.empty() ? nullptr : nccl_ifname.c_str());
+    }
+#endif
 
     log_info("loading model (" + model_path + ")...");
     auto t0 = std::chrono::steady_clock::now();

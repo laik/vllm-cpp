@@ -29,7 +29,7 @@ cmake .. -DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc
 
 ## Usage
 
-### CPU Runner
+### CPU Runner  
 
 ```bash
 ./cpu_runner /path/to/Qwen3-8B "Hello world"
@@ -39,7 +39,7 @@ cmake .. -DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc
 ### HTTP Server
 
 ```bash
-./http_server /path/to/Qwen3-8B --port 8080
+./build/http_server /Users/dxp/claude/qwen-test/qwen/Qwen2___5-0___5B-Instruct --port 8080
 ```
 
 Supports OpenAI-compatible endpoints:
@@ -54,7 +54,7 @@ Supports OpenAI-compatible endpoints:
 curl -X POST http://localhost:8080/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "qwen3.6-35b-a3b",
+    "model": "Qwen2___5-0___5B-Instruct",
     "messages": [{"role": "user", "content": "What is C++?"}],
     "temperature": 0.7,
     "max_tokens": 100
@@ -65,7 +65,7 @@ Streaming:
 ```bash
 curl -X POST http://localhost:8080/v1/chat/completions \
   -H "Content-Type: application/json" \
-  -d '{"model":"qwen3.6","messages":[{"role":"user","content":"Hello"}],"stream":true}'
+  -d '{"model":"Qwen2___5-0___5B-Instruct","messages":[{"role":"user","content":"Hello"}],"stream":true}'
 ```
 
 ## Model Loading

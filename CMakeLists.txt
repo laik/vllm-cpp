@@ -108,16 +108,31 @@ target_compile_options(cpu_runner PRIVATE ${CPU_FLAGS})
 
 # CUDA library
 if(CUDA_FOUND)
+    find_library(NCCL_LIBRARY nccl HINTS /usr/lib /usr/local/lib ${CUDA_TOOLKIT_ROOT_DIR}/lib64)
+    find_path(NCCL_INCLUDE_DIR nccl.h HINTS /usr/include /usr/local/include ${CUDA_TOOLKIT_ROOT_DIR}/include)
+
+    if(NCCL_LIBRARY AND NCCL_INCLUDE_DIR)
+        message(STATUS "NCCL found: ${NCCL_LIBRARY}")
+    else()
+        message(WARNING "NCCL not found - tensor parallel support disabled")
+    endif()
+
     add_library(vllm-cuda STATIC
         cuda/attention.cu
         cuda/moe_dispatch.cu
+        cuda/tp.cu
+        cuda/tp_model.cu
     )
-    target_include_directories(vllm-cuda PUBLIC src cuda)
+    target_include_directories(vllm-cuda PUBLIC src cuda ${NCCL_INCLUDE_DIR})
     set_target_properties(vllm-cuda PROPERTIES
         CUDA_ARCHITECTURES "${CUDA_ARCHS}"
         CUDA_FLAGS "${CUDA_FLAGS}"
     )
-    target_link_libraries(vllm-cuda vllm-core)
+    find_library(CUBLAS_LIBRARY cublas HINTS ${CUDA_TOOLKIT_ROOT_DIR}/lib64)
+    target_link_libraries(vllm-cuda vllm-core ${NCCL_LIBRARY} ${CUBLAS_LIBRARY})
+    if(NCCL_LIBRARY)
+        target_compile_definitions(vllm-cuda PUBLIC HAS_NCCL)
+    endif()
     message(STATUS "CUDA library: vllm-cuda")
 endif()
 
