@@ -55,9 +55,9 @@ curl -X POST http://localhost:8080/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
     "model": "Qwen2___5-0___5B-Instruct",
-    "messages": [{"role": "user", "content": "What is C++?"}],
+    "messages": [{"role": "user", "content": "What is C++? , explain func with 100 words"}],
     "temperature": 0.7,
-    "max_tokens": 100
+    "max_tokens": 20
   }'
 ```
 

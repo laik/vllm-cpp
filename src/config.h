@@ -51,7 +51,47 @@ constexpr int32_t    MAX_SEQ_PER_BLOCK   = BLOCK_SIZE;
 
 // ----- Quantization -----
 constexpr bool       QUANT_ENABLED       = false;   // fp16/bf16 weight only
-constexpr int32_t    QUANT_GROUP_SIZE    = 64;
+constexpr int32_t    QUANT_GROUP_SIZE    = 128;     // default group size for GPTQ/AWQ
+
+// ============================================================
+// Quantization methods (matches vLLM quantization config)
+// ============================================================
+enum class QuantMethod : uint8_t {
+    NONE    = 0,
+    GPTQ    = 1,
+    AWQ     = 2,
+    FP8     = 3,   // FP8 W8A8
+    FP8_KV  = 4,   // FP8 KV cache only (weights remain FP16/BF16)
+    INT8    = 5,
+};
+
+// KV cache data type
+enum class KVDtype : uint8_t {
+    FP32      = 0,
+    FP16      = 1,
+    FP8_E4M3  = 2,
+};
+
+// Quantization configuration (parsed from model config.json)
+struct QuantConfig {
+    QuantMethod method = QuantMethod::NONE;
+    int32_t bits = 4;             // 4 for INT4, 8 for INT8/FP8
+    int32_t group_size = 128;     // group size for GPTQ/AWQ
+    bool desc_act = false;        // GPTQ act-order (g_idx present)
+    bool sym = true;              // symmetric quantization
+    KVDtype kv_dtype = KVDtype::FP32;  // KV cache precision
+
+    bool enabled() const { return method != QuantMethod::NONE; }
+    bool is_gptq() const { return method == QuantMethod::GPTQ; }
+    bool is_awq()  const { return method == QuantMethod::AWQ; }
+    bool is_fp8()  const { return method == QuantMethod::FP8; }
+    bool is_fp8_kv() const { return method == QuantMethod::FP8_KV; }
+
+    // FP8 KV cache can be enabled independently of weight quantization
+    bool kv_is_fp8() const {
+        return kv_dtype == KVDtype::FP8_E4M3 || method == QuantMethod::FP8_KV;
+    }
+};
 
 // ----- Generation -----
 constexpr float      TEMPERATURE         = 0.7f;

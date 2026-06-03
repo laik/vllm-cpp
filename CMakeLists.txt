@@ -47,12 +47,12 @@ if(MLX_INCLUDE_DIR AND MLX_LIBRARY)
         INSTALL_RPATH "/opt/homebrew/lib/python3.11/site-packages/mlx/lib"
     )
 
-    # HTTP server with MLX GPU
-    add_executable(http_server src/http_server.cpp)
-    target_include_directories(http_server PRIVATE src ${MLX_INCLUDE_DIR})
-    target_link_libraries(http_server vllm-core mlx_backend ${MLX_LIBRARY} ${MLX_JACCL_LIBRARY})
-    target_compile_options(http_server PRIVATE ${CPU_FLAGS})
-    set_target_properties(http_server PROPERTIES
+    # Unified HTTP server with MLX GPU
+    add_executable(server src/server.cpp)
+    target_include_directories(server PRIVATE src ${MLX_INCLUDE_DIR})
+    target_link_libraries(server vllm-core mlx_backend ${MLX_LIBRARY} ${MLX_JACCL_LIBRARY})
+    target_compile_options(server PRIVATE ${CPU_FLAGS})
+    set_target_properties(server PROPERTIES
         BUILD_RPATH "${CMAKE_CURRENT_BINARY_DIR};${CMAKE_CURRENT_SOURCE_DIR}/build;/opt/homebrew/lib/python3.11/site-packages/mlx/lib"
         INSTALL_RPATH "/opt/homebrew/lib/python3.11/site-packages/mlx/lib"
     )
@@ -68,9 +68,9 @@ if(MLX_INCLUDE_DIR AND MLX_LIBRARY)
     )
 else()
     message(STATUS "MLX not found — building CPU-only server/CLI")
-    add_executable(http_server src/http_server.cpp)
-    target_link_libraries(http_server vllm-core)
-    target_compile_options(http_server PRIVATE ${CPU_FLAGS})
+    add_executable(server src/server.cpp)
+    target_link_libraries(server vllm-core)
+    target_compile_options(server PRIVATE ${CPU_FLAGS})
 
     add_executable(interactive src/interactive.cpp)
     target_link_libraries(interactive vllm-core)
@@ -95,7 +95,15 @@ else()
 endif()
 
 # Core library (CPU)
-add_library(vllm-core STATIC src/model.cpp)
+add_library(vllm-core STATIC
+    src/model.cpp
+    src/quantization.cpp
+    src/quant_loader.cpp
+    src/kv_cache_manager.cpp
+    src/paged_attention.cpp
+    src/paged_engine.cpp
+    src/scheduler.cpp
+)
 target_include_directories(vllm-core PUBLIC src)
 target_compile_options(vllm-core PRIVATE ${CPU_FLAGS})
 
@@ -104,7 +112,7 @@ add_executable(cpu_runner src/cpu_runner.cpp)
 target_link_libraries(cpu_runner vllm-core)
 target_compile_options(cpu_runner PRIVATE ${CPU_FLAGS})
 
-# (http_server and interactive built with MLX above)
+# (server and interactive built with MLX above)
 
 # CUDA library
 if(CUDA_FOUND)
@@ -137,7 +145,7 @@ if(CUDA_FOUND)
 endif()
 
 # Install
-install(TARGETS cpu_runner http_server DESTINATION bin)
+install(TARGETS cpu_runner server DESTINATION bin)
 if(CUDA_FOUND)
     install(TARGETS vllm-cuda DESTINATION lib)
 endif()

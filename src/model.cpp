@@ -1,4 +1,5 @@
 #include "model.h"
+#include "quant_loader.h"
 #include <fstream>
 #include <sstream>
 #include <iostream>
@@ -377,6 +378,15 @@ Qwen36Model load_model_safetensors(const std::string& model_path) {
         int32_t head_dim_cfg = (int32_t)parse_json_int(cfg, "head_dim");
         if (head_dim_cfg > 0) model.head_dim = head_dim_cfg;
         // head_dim may be refined later from tensor shapes; log after that
+
+        // ---- Load quantization config ----
+        model.quant_config = parse_quant_config(cfg);
+    }
+
+    // ---- Load quantized tensors if model is quantized ----
+    std::map<std::string, QuantizedTensor> quant_tensors;
+    if (model.quant_config.enabled()) {
+        quant_tensors = load_quantized_tensors(model_path, model.quant_config);
     }
 
     auto find_tensor = [&](const std::vector<std::string>& names) -> Tensor* {
@@ -453,26 +463,41 @@ Qwen36Model load_model_safetensors(const std::string& model_path) {
             return nullptr;
         };
 
+        // Helper: assign quantized tensor if available
+        auto assign_quant = [&](Tensor& t, const std::string& base_name) {
+            if (!model.quant_config.enabled()) return;
+            auto key = prefix + base_name;
+            auto it = quant_tensors.find(key);
+            if (it != quant_tensors.end()) {
+                t.quant = new QuantizedTensor(std::move(it->second));
+                t.precision = model.quant_config.is_gptq() ? Precision::INT4_GPTQ :
+                              model.quant_config.is_awq()  ? Precision::INT4_AWQ :
+                              model.quant_config.is_fp8()  ? Precision::FP8_E4M3 :
+                              Precision::F32;
+                std::cerr << "  Layer " << l << " " << base_name << ": quantized ("
+                          << t.shape[0] << " x " << t.shape[1] << ")" << std::endl;
+            }
+        };
+
         // Input norm
         auto* inp_norm = gt("input_layernorm.weight");
         if (inp_norm) { model.layers[l].input_norm.weight = *inp_norm; }
-        model.layers[l].input_norm.eps = model.norm_eps;
 
         // Attention
         auto* qp = gt("self_attn.q_proj.weight");
-        if (qp) model.layers[l].attn.q_proj = *qp;
+        if (qp) { model.layers[l].attn.q_proj = *qp; assign_quant(model.layers[l].attn.q_proj, "self_attn.q_proj"); }
         auto* qb = gt("self_attn.q_proj.bias");
         if (qb) model.layers[l].attn.q_proj_bias = *qb;
         auto* kp = gt("self_attn.k_proj.weight");
-        if (kp) model.layers[l].attn.k_proj = *kp;
+        if (kp) { model.layers[l].attn.k_proj = *kp; assign_quant(model.layers[l].attn.k_proj, "self_attn.k_proj"); }
         auto* kb = gt("self_attn.k_proj.bias");
         if (kb) model.layers[l].attn.k_proj_bias = *kb;
         auto* vp = gt("self_attn.v_proj.weight");
-        if (vp) model.layers[l].attn.v_proj = *vp;
+        if (vp) { model.layers[l].attn.v_proj = *vp; assign_quant(model.layers[l].attn.v_proj, "self_attn.v_proj"); }
         auto* vb = gt("self_attn.v_proj.bias");
         if (vb) model.layers[l].attn.v_proj_bias = *vb;
         auto* op = gt("self_attn.o_proj.weight");
-        if (op) model.layers[l].attn.o_proj = *op;
+        if (op) { model.layers[l].attn.o_proj = *op; assign_quant(model.layers[l].attn.o_proj, "self_attn.o_proj"); }
         auto* qn = gt("self_attn.q_norm.weight");
         if (qn) model.layers[l].attn.q_norm = *qn;
         auto* kn = gt("self_attn.k_norm.weight");
@@ -492,6 +517,9 @@ Qwen36Model load_model_safetensors(const std::string& model_path) {
             model.layers[l].mlp.up_proj = *up_w;
             model.layers[l].mlp.down_proj = *down_w;
             model.ffn_intermediate = (int32_t)gate_w->shape[0];
+            assign_quant(model.layers[l].mlp.gate_proj, "mlp.gate_proj");
+            assign_quant(model.layers[l].mlp.up_proj, "mlp.up_proj");
+            assign_quant(model.layers[l].mlp.down_proj, "mlp.down_proj");
         }
 
         // MoE
@@ -915,6 +943,16 @@ static void matmul_transpose(const float* a, int32_t m, int32_t k,
     }
 }
 
+// Quantization-aware matmul: uses fused dequant if weight is quantized
+static void qmatmul(const float* a, int32_t m, int32_t k,
+                    const Tensor& weight, int32_t n, float* c) {
+    if (weight.is_quantized() && weight.quant) {
+        quantized_matmul_transpose(a, m, k, *weight.quant, n, c);
+    } else {
+        matmul_transpose(a, m, k, weight.data, n, c);
+    }
+}
+
 static void add_vectors(float* out, const float* a, const float* b, int32_t n) {
     for (int32_t i = 0; i < n; i++) out[i] = a[i] + b[i];
 }
@@ -1144,8 +1182,8 @@ std::vector<float> forward_cpu(
                      layer.input_norm.weight.data, hidden, layer.input_norm.eps);
 
             // --- K projection + RoPE + cache ---
-            matmul_transpose(layer.attn.k_proj.data, kv_dim, hidden,
-                             attn_out, 1, k_buf);
+            qmatmul(attn_out, 1, hidden,
+                    layer.attn.k_proj, kv_dim, k_buf);
             if (layer.attn.k_proj_bias.data)
                 add_bias(k_buf, layer.attn.k_proj_bias.data, kv_dim);
 
@@ -1156,8 +1194,8 @@ std::vector<float> forward_cpu(
                       k_cache + l * seq_len * kv_dim + pos * kv_dim);
 
             // --- V projection + cache ---
-            matmul_transpose(layer.attn.v_proj.data, kv_dim, hidden,
-                             attn_out, 1, v_buf);
+            qmatmul(attn_out, 1, hidden,
+                     layer.attn.v_proj, kv_dim, v_buf);
             if (layer.attn.v_proj_bias.data)
                 add_bias(v_buf, layer.attn.v_proj_bias.data, kv_dim);
 
@@ -1165,8 +1203,8 @@ std::vector<float> forward_cpu(
                       v_cache + l * seq_len * kv_dim + pos * kv_dim);
 
             // --- Q projection + RoPE ---
-            matmul_transpose(layer.attn.q_proj.data, hidden, hidden,
-                             attn_out, 1, q_buf);
+            qmatmul(attn_out, 1, hidden,
+                     layer.attn.q_proj, hidden, q_buf);
             if (layer.attn.q_proj_bias.data)
                 add_bias(q_buf, layer.attn.q_proj_bias.data, hidden);
 
@@ -1182,8 +1220,8 @@ std::vector<float> forward_cpu(
                 pos + 1, model.num_heads, model.head_dim, model.num_kv_heads);
 
             // Output projection + residual
-            matmul_transpose(layer.attn.o_proj.data, hidden, total_heads_dim,
-                             attn_result, 1, attn_out);
+            qmatmul(attn_result, 1, total_heads_dim,
+                     layer.attn.o_proj, hidden, attn_out);
             add_vectors(hidden_states + pos * hidden,
                         hidden_states + pos * hidden,
                         attn_out, hidden);
@@ -1195,15 +1233,15 @@ std::vector<float> forward_cpu(
             // --- MLP ---
             if (layer.moe.experts && layer.moe.gate.data) {
                 moe_forward(mlp_out, attn_out, hidden, layer.moe, model.top_k);
-            } else if (layer.mlp.gate_proj.data) {
-                matmul_transpose(layer.mlp.gate_proj.data, ffn_dim, hidden,
-                                 attn_out, 1, gate_act);
-                matmul_transpose(layer.mlp.up_proj.data, ffn_dim, hidden,
-                                 attn_out, 1, up_act);
+            } else if (layer.mlp.gate_proj.data || layer.mlp.gate_proj.is_quantized()) {
+                qmatmul(attn_out, 1, hidden,
+                        layer.mlp.gate_proj, ffn_dim, gate_act);
+                qmatmul(attn_out, 1, hidden,
+                        layer.mlp.up_proj, ffn_dim, up_act);
                 for (int32_t i = 0; i < ffn_dim; i++)
                     mlp_out[i] = swiglu(gate_act[i]) * up_act[i];
-                matmul_transpose(layer.mlp.down_proj.data, hidden, ffn_dim,
-                                 mlp_out, 1, mlp_out);
+                qmatmul(mlp_out, 1, ffn_dim,
+                        layer.mlp.down_proj, hidden, mlp_out);
             }
 
             // Residual
@@ -1221,8 +1259,8 @@ std::vector<float> forward_cpu(
     // LM head
     int32_t vocab = model.vocab_size;
     std::vector<float> logits(vocab);
-    matmul_transpose(model.lm_head.data, vocab, hidden,
-                     final_norm_out, 1, logits.data());
+    qmatmul(final_norm_out, 1, hidden,
+            model.lm_head, vocab, logits.data());
 
     // Cleanup
     delete[] k_cache; delete[] v_cache;
@@ -1343,50 +1381,4 @@ std::vector<int32_t> generate_cpu(
     }
 
     return output;
-}
-
-// ============================================================
-// BlockPool
-// ============================================================
-
-BlockPool::BlockPool(int32_t num_blocks) : blocks(num_blocks) {
-    for (auto& b : blocks) {
-        b.block_id = (int32_t)(&b - blocks.data());
-        b.free = true;
-    }
-    next_free = 0;
-}
-
-int32_t BlockPool::alloc() {
-    for (int32_t i = next_free; i < (int32_t)blocks.size(); i++) {
-        if (blocks[i].free) {
-            blocks[i].free = false;
-            blocks[i].ref_count = 1;
-            next_free = i + 1;
-            return blocks[i].block_id;
-        }
-    }
-    for (int32_t i = 0; i < next_free; i++) {
-        if (blocks[i].free) {
-            blocks[i].free = false;
-            blocks[i].ref_count = 1;
-            next_free = i + 1;
-            return blocks[i].block_id;
-        }
-    }
-    return -1;
-}
-
-void BlockPool::free(int32_t block_id) {
-    if (block_id < 0 || block_id >= (int32_t)blocks.size()) return;
-    blocks[block_id].ref_count--;
-    if (blocks[block_id].ref_count <= 0) {
-        blocks[block_id].free = true;
-        blocks[block_id].ref_count = 0;
-        if (block_id < next_free) next_free = block_id;
-    }
-}
-
-bool BlockPool::is_free(int32_t block_id) const {
-    return block_id >= 0 && block_id < (int32_t)blocks.size() && blocks[block_id].free;
 }

@@ -1,27 +1,50 @@
 #pragma once
 #include "config.h"
+#include "quantization.h"
 #include <vector>
 #include <string>
 #include <functional>
+#include <memory>
 
 // ============================================================
-// Tensor storage - simple flat array with shape metadata
+// Tensor storage - supports FP32, FP16, BF16, and quantized
 // ============================================================
-enum class Precision : int8_t { F32, F16, BF16 };
+enum class Precision : int8_t {
+    F32, F16, BF16,
+    FP8_E4M3,       // FP8 E4M3 (W8A8)
+    INT4_GPTQ,      // GPTQ INT4
+    INT4_AWQ        // AWQ INT4
+};
 
 struct Tensor {
     std::vector<int64_t> shape;
-    float* data = nullptr;       // always fp32 for CPU
+    float* data = nullptr;       // always fp32 for CPU (legacy)
     void* gpu_data = nullptr;    // fp16/bf16 on GPU
     Precision precision = Precision::F32;
     int64_t numel = 0;
     int64_t byte_size = 0;
 
+    // Quantized tensor (for GPTQ/AWQ/FP8 models)
+    // Owned by this Tensor; caller must delete in destructor or manage externally
+    QuantizedTensor* quant = nullptr;
+
     int64_t count() const { return numel; }
     int64_t elem_size() const {
-        return (precision == Precision::F16) ? 2 : 4;
+        if (quant && quant->is_quantized()) {
+            return 1;  // approximate
+        }
+        switch (precision) {
+            case Precision::F16:
+            case Precision::BF16: return 2;
+            case Precision::FP8_E4M3: return 1;
+            default: return 4;
+        }
     }
     int64_t allocated_bytes() const { return byte_size; }
+
+    bool is_quantized() const {
+        return quant && quant->is_quantized();
+    }
 
     void allocate_float(int64_t n) {
         numel = n;
@@ -30,8 +53,21 @@ struct Tensor {
     }
 
     std::vector<float> to_vector() const {
+        if (quant && quant->is_quantized()) {
+            return quant->to_float_vector();
+        }
         if (!data || numel == 0) return {};
         return std::vector<float>(data, data + numel);
+    }
+
+    // Dequantize one row → [in_features] floats (for row-wise access)
+    std::vector<float> dequantize_row(int32_t row) const {
+        if (quant && quant->is_quantized()) {
+            return quant->dequantize_row(row);
+        }
+        // FP32 fallback: copy row
+        int64_t cols = numel / (int64_t)shape[0];
+        return std::vector<float>(data + row * cols, data + (row + 1) * cols);
     }
 };
 
@@ -119,6 +155,9 @@ struct Qwen36Model {
     // Tokenizer
     TokenizerConfig tokenizer;
 
+    // Quantization config
+    QuantConfig quant_config;
+
     // Metadata
     std::string model_path;
     std::string architecture;
@@ -176,25 +215,4 @@ std::vector<int32_t> tokenize(const TokenizerConfig& tok, const std::string& tex
 std::vector<std::string> decode_tokens(const TokenizerConfig& tok, const std::vector<int32_t>& ids);
 std::string decode_token(const TokenizerConfig& tok, int32_t id);
 
-// ============================================================
-// PagedAttention structures
-// ============================================================
-struct BlockEntry {
-    int32_t block_id = -1;
-    int32_t ref_count = 0;
-    bool free = true;
-};
-
-struct BlockTable {
-    std::vector<int32_t> blocks;
-};
-
-struct BlockPool {
-    std::vector<BlockEntry> blocks;
-    int32_t next_free = 0;
-
-    BlockPool(int32_t num_blocks);
-    int32_t alloc();
-    void free(int32_t block_id);
-    bool is_free(int32_t block_id) const;
-};
+// PagedAttention structures moved to kv_cache_manager.h
