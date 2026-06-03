@@ -46,7 +46,9 @@ $(BUILD_DIR):
 # ============================================================
 # Core library
 # ============================================================
-CORE_SRC  := $(SRC_DIR)/model.cpp $(SRC_DIR)/quantization.cpp $(SRC_DIR)/quant_loader.cpp
+CORE_SRC  := $(SRC_DIR)/model.cpp $(SRC_DIR)/quantization.cpp $(SRC_DIR)/quant_loader.cpp \
+             $(SRC_DIR)/kv_cache_manager.cpp $(SRC_DIR)/paged_attention.cpp \
+             $(SRC_DIR)/paged_engine.cpp $(SRC_DIR)/scheduler.cpp
 CORE_OBJ  := $(patsubst $(SRC_DIR)/%.cpp,$(BUILD_DIR)/%.o,$(CORE_SRC))
 CORE_LIB  := $(BUILD_DIR)/libvllm-core.a
 
